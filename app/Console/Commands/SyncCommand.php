@@ -3,8 +3,11 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use PHPHtmlParser\Dom;
+use App\Models\Country;
+use App\Models\Entry;
 
 class SyncCommand extends Command
 {
@@ -19,16 +22,19 @@ class SyncCommand extends Command
     
     public function handle()
     {
+        // get data
         $response = Http::get($this->sourceUrl);
         if (!$response->successful()) {
             $this->error('HTTP Error: '.$response->body());
         }
+        // parse data
         $html = $response->body();
         $items = $this->parseData($html);
-        dd($items);
+        // sync data
+        $items = $this->syncCountries($items);
+        $this->syncEntries($items);
     }
     
-    // Credits to: https://github.com/BaseMax/CoronaVirusOutbreakAPI
     public function parseData($html) {
         if ($html == '' || $html == null) return [];
         $dom = new Dom;
@@ -47,7 +53,6 @@ class SyncCommand extends Command
         return $items;
     }
     
-    // Credits to: https://github.com/BaseMax/CoronaVirusOutbreakAPI
     public function prepareEntry($cols) {
         $item = [
             'country'   => $cols[0],
@@ -66,6 +71,52 @@ class SyncCommand extends Command
         $item['active']    = (int) preg_replace('/[^\d]/', '', $item['active'])    ?: 0;
         $item['critical']  = (int) preg_replace('/[^\d]/', '', $item['critical'])  ?: 0;
         return $item;
+    }
+    
+    public function syncEntries($items) {
+        $latestEntriesIds = Entry::select(DB::raw('max(id) as id, country_id'))->groupBy('country_id')->get();
+        $latestEntries = Entry::whereIn('id', $latestEntriesIds->pluck('id'))->get()->keyBy('country_id');
+        
+        $insertBatch = [];
+        $now = now();
+        foreach ($items as $item) {
+            if (empty($item['country_id'])) continue;
+            // don't insert if entry has same data
+            $latestResult = $latestEntries->get($item['country_id']);
+            if ($latestResult) {
+                $latestHash = "hash-{$latestResult->country_id}-{$latestResult->cases}-{$latestResult->deaths}-{$latestResult->recovered}-{$latestResult->active}-{$latestResult->critical}";
+                $currentHash = "hash-{$item['country_id']}-{$item['cases']}-{$item['deaths']}-{$item['recovered']}-{$item['active']}-{$item['critical']}";
+                if ($latestHash == $currentHash) continue;
+            }
+            $insertBatch[] = [
+                'created_at' => $now,
+                'updated_at' => $now,
+                'country_id' => $item['country_id'],
+                'cases'      => $item['cases'],
+                'deaths'     => $item['deaths'],
+                'recovered'  => $item['recovered'],
+                'active'     => $item['active'],
+                'critical'   => $item['critical'],
+            ];
+        }
+        Entry::insert($insertBatch);
+    }
+    
+    public function syncCountries($items) {
+        $countries = Country::get()->pluck('id', 'name')->all();
+        foreach ($items as &$item) {
+            if (!isset($countries[$item['country']])) {
+                $newCountry = null;
+                $newCountry = new Country;
+                $newCountry->name = $item['country'];
+                $newCountry->aliases = [];
+                if ($newCountry->save()) {
+                    $countries[$item['country']] = $newCountry->id;
+                }
+            }
+            $item['country_id'] = $countries[$item['country']];
+        }
+        return $items;
     }
     
 }
